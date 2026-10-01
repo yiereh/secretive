@@ -158,6 +158,9 @@ extension Agent {
             logger.debug("Agent did not have a key matching \(keyBlobHex)")
             throw NoMatchingKeyError()
         }
+        // A locked session can't present the authentication prompt, so fail fast instead of
+        // letting the request wait on the lock screen's biometric evaluation indefinitely.
+        try SessionPreflight.assertCanAuthenticate(secret: secret)
         logger.debug("Agent offering witness chance to object")
         do {
             try await witness?.speakNowOrForeverHoldYourPeace(forAccessTo: secret, from: store, by: provenance, target: target)

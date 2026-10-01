@@ -18,6 +18,10 @@ extension SecureEnclave {
         public let id = UUID()
         public let name = String(localized: .secureEnclave)
 
+        /// Runs blocking SEP operations on dedicated worker threads instead of the
+        /// cooperative pool, so a single wedged XPC call can't starve the agent.
+        private let signingWorkers = SigningWorkerPool(maxConcurrentWorkers: 4, timeout: .seconds(30))
+
         /// Initializes a Store.
         @MainActor public init() {
             loadSecrets()
@@ -59,22 +63,26 @@ extension SecureEnclave {
             }
             let attributes = try JSONDecoder().decode(Attributes.self, from: attributesData)
 
-            switch attributes.keyType {
-            case .ecdsa256:
-                let key = try CryptoKit.SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: keyData, authenticationContext: context)
-                return try key.signature(for: data).rawRepresentation
-            case .mldsa65:
-                guard #available(macOS 26.0, *)  else { throw UnsupportedAlgorithmError() }
-                let key = try CryptoKit.SecureEnclave.MLDSA65.PrivateKey(dataRepresentation: keyData, authenticationContext: context)
-                return try key.signature(for: data)
-            case .mldsa87:
-                guard #available(macOS 26.0, *)  else { throw UnsupportedAlgorithmError() }
-                let key = try CryptoKit.SecureEnclave.MLDSA87.PrivateKey(dataRepresentation: keyData, authenticationContext: context)
-                return try key.signature(for: data)
-            default:
-                throw UnsupportedAlgorithmError()
+            // The SEP calls below are synchronous and can block on XPC to ctkd indefinitely,
+            // so they run on a worker thread instead of Swift's cooperative pool.
+            let contextBox = UncheckedSendable(context)
+            return try await signingWorkers.perform {
+                switch attributes.keyType {
+                case .ecdsa256:
+                    let key = try CryptoKit.SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: keyData, authenticationContext: contextBox.value)
+                    return try key.signature(for: data).rawRepresentation
+                case .mldsa65:
+                    guard #available(macOS 26.0, *)  else { throw UnsupportedAlgorithmError() }
+                    let key = try CryptoKit.SecureEnclave.MLDSA65.PrivateKey(dataRepresentation: keyData, authenticationContext: contextBox.value)
+                    return try key.signature(for: data)
+                case .mldsa87:
+                    guard #available(macOS 26.0, *)  else { throw UnsupportedAlgorithmError() }
+                    let key = try CryptoKit.SecureEnclave.MLDSA87.PrivateKey(dataRepresentation: keyData, authenticationContext: contextBox.value)
+                    return try key.signature(for: data)
+                default:
+                    throw UnsupportedAlgorithmError()
+                }
             }
-
         }
 
         @MainActor public func reloadSecrets() {
@@ -109,29 +117,28 @@ extension SecureEnclave {
             if let error = unsafe accessError {
                 throw unsafe error.takeRetainedValue() as Error
             }
-            let dataRep: Data
-            let publicKey: Data
-            switch attributes.keyType {
-            case .ecdsa256:
-                let created = try CryptoKit.SecureEnclave.P256.Signing.PrivateKey(accessControl: access!)
-                dataRep = created.dataRepresentation
-                publicKey = created.publicKey.x963Representation
-            case .mldsa65:
-                guard #available(macOS 26.0, *) else { throw Attributes.UnsupportedOptionError() }
-                let created = try CryptoKit.SecureEnclave.MLDSA65.PrivateKey(accessControl: access!)
-                dataRep = created.dataRepresentation
-                publicKey = created.publicKey.rawRepresentation
-            case .mldsa87:
-                guard #available(macOS 26.0, *) else { throw Attributes.UnsupportedOptionError() }
-                let created = try CryptoKit.SecureEnclave.MLDSA87.PrivateKey(accessControl: access!)
-                dataRep = created.dataRepresentation
-                publicKey = created.publicKey.rawRepresentation
-            default:
-                throw Attributes.UnsupportedOptionError()
+            // Key generation also talks to the SEP and can block on XPC, so it runs on a worker.
+            let accessBox = UncheckedSendable(access!)
+            let createdKeys = try await signingWorkers.perform {
+                switch attributes.keyType {
+                case .ecdsa256:
+                    let created = try CryptoKit.SecureEnclave.P256.Signing.PrivateKey(accessControl: accessBox.value)
+                    return (dataRepresentation: created.dataRepresentation, publicKey: created.publicKey.x963Representation)
+                case .mldsa65:
+                    guard #available(macOS 26.0, *) else { throw Attributes.UnsupportedOptionError() }
+                    let created = try CryptoKit.SecureEnclave.MLDSA65.PrivateKey(accessControl: accessBox.value)
+                    return (dataRepresentation: created.dataRepresentation, publicKey: created.publicKey.rawRepresentation)
+                case .mldsa87:
+                    guard #available(macOS 26.0, *) else { throw Attributes.UnsupportedOptionError() }
+                    let created = try CryptoKit.SecureEnclave.MLDSA87.PrivateKey(accessControl: accessBox.value)
+                    return (dataRepresentation: created.dataRepresentation, publicKey: created.publicKey.rawRepresentation)
+                default:
+                    throw Attributes.UnsupportedOptionError()
+                }
             }
-            let id = try saveKey(dataRep, name: name, attributes: attributes)
+            let id = try saveKey(createdKeys.dataRepresentation, name: name, attributes: attributes)
             await reloadSecrets()
-            return Secret(id: id, name: name, publicKey: publicKey, attributes: attributes)
+            return Secret(id: id, name: name, publicKey: createdKeys.publicKey, attributes: attributes)
         }
 
         public func delete(secret: Secret) async throws {
@@ -276,4 +283,15 @@ extension SecureEnclave.Store {
     struct UnsupportedAlgorithmError: Error {}
     struct MissingAttributesError: Error {}
 
+}
+
+/// Wraps a value that isn't annotated `Sendable`, but is used from a worker thread at a
+/// well-defined point where the underlying type is safe to use across threads
+/// (`LAContext` and `SecAccessControl` both qualify for the calls made here).
+private struct UncheckedSendable<T>: @unchecked Sendable {
+    let value: T
+
+    init(_ value: T) {
+        self.value = value
+    }
 }
